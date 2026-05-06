@@ -1,15 +1,15 @@
 """
-Protocol Gary — independent audit protocol for AI agents.
+Gary — independent audit protocol for AI agent plans.
 
-Before execution: Gary reviews the plan.
-After execution: Gary verifies the outcome.
+Before execution: Gary checks the plan against the full LLM failure mode taxonomy.
 Gary is never the same LLM as the agent being audited.
 
-  from gary import GaryProtocol, Judgment, GaryVerdict
+    from gary import Gary, Verdict, GaryVerdict
 """
 
-from gary.protocol import GaryProtocol, GaryVerdict, Judgment, LLMBackend
+from gary.protocol import Gary, LLMBackend
+from gary.verdict import GaryVerdict, Verdict
 
-__all__ = ["GaryProtocol", "Judgment", "GaryVerdict", "LLMBackend"]
+__all__ = ["Gary", "GaryVerdict", "Verdict", "LLMBackend"]
 
 __version__ = "0.1.0"

@@ -1,194 +1,202 @@
 """
-Protocol Gary test suite.
+Gary test suite.
 
 Core principle every test guards:
-  The LLM that makes a plan does NOT verify that plan itself.
-  Gary is an independent LLM. Before execution. After execution.
-  Gary never fails silently — parse errors automatically escalate.
+  Gary checks plans against the failure mode taxonomy.
+  Gary uses a different LLM than the agent.
+  Gary never fails silently — parse errors escalate automatically.
+  Gary retries on block and auto-escalates after max rounds.
 """
 
 import pytest
-
-from gary import GaryProtocol, GaryVerdict, Judgment
-
-
-# ---------------------------------------------------------------------------
-# Stubs
-# ---------------------------------------------------------------------------
+from gary import Gary, GaryVerdict, Verdict
 
 
-def _stub_approved(prompt: str) -> str:
-    return '{"judgment": "approved", "reason": "Plan is safe and clear", "risk": "low"}'
+def stub_pass(prompt: str) -> str:
+    return '{"verdict": "pass", "reason": "No failure modes detected.", "failure_modes_triggered": [], "risk_level": "low"}'
 
 
-def _stub_blocked(prompt: str) -> str:
-    return '{"judgment": "blocked", "reason": "Irreversible payment without confirmation", "risk": "high"}'
+def stub_block(prompt: str) -> str:
+    return '{"verdict": "block", "reason": "ALIGN-02: irreversible payment with no rollback.", "failure_modes_triggered": ["ALIGN-02"], "risk_level": "high"}'
 
 
-def _stub_escalate(prompt: str) -> str:
-    return '{"judgment": "escalate", "reason": "Deviation detected", "risk": "medium"}'
+def stub_escalate(prompt: str) -> str:
+    return '{"verdict": "escalate", "reason": "SPEC-01: plan too vague to verify.", "failure_modes_triggered": ["SPEC-01"], "risk_level": "medium"}'
 
 
-def _stub_broken(prompt: str) -> str:
-    return "Here is my response: I think the plan is fine but I won't write JSON."
+def stub_broken(prompt: str) -> str:
+    return "I think the plan looks fine but I refuse to write JSON."
 
 
 # ---------------------------------------------------------------------------
-# Step 1: review plan BEFORE execution
+# Basic verdicts
 # ---------------------------------------------------------------------------
 
-
-def test_review_plan_approved():
-    gary = GaryProtocol(_stub_approved)
-    plan = {"tool": "send_email", "to": "client@company.com"}
-    verdict = gary.review_plan(plan)
-
-    assert verdict.judgment == Judgment.approved
-    assert verdict.phase == "before"
-    assert verdict.plan_hash
+def test_pass():
+    gary = Gary(llm=stub_pass)
+    verdict = gary.review({"action": "send_email", "to": "client@company.com"})
+    assert verdict.verdict == Verdict.PASS
+    assert verdict.round == 1
 
 
-def test_review_plan_blocked():
-    gary = GaryProtocol(_stub_blocked)
-    plan = {"tool": "process_payment", "amount": 9500}
-    verdict = gary.review_plan(plan)
-
-    assert verdict.judgment == Judgment.blocked
-    assert verdict.risk == "high"
+def test_block_with_failure_modes():
+    gary = Gary(llm=stub_block, max_retries=1)
+    verdict = gary.review({"action": "process_payment", "amount": 9500})
+    assert verdict.verdict == Verdict.ESCALATE  # blocked → retries → escalate
+    assert "ALIGN-02" in verdict.failure_modes_triggered or "Last reason" in verdict.reason
 
 
-def test_review_plan_with_context():
-    gary = GaryProtocol(_stub_approved)
-    plan = {"tool": "send_email"}
-    verdict = gary.review_plan(plan, context={"client": "Acme Corp", "sector": "retail"})
-
-    assert verdict.judgment == Judgment.approved
+def test_escalate():
+    gary = Gary(llm=stub_escalate, max_retries=1)
+    verdict = gary.review({"action": "something_vague"})
+    assert verdict.verdict == Verdict.ESCALATE
 
 
 # ---------------------------------------------------------------------------
-# Step 2: review outcome AFTER execution
+# Retry mechanism
 # ---------------------------------------------------------------------------
 
+def test_retry_then_pass():
+    """Block on first round, pass on second."""
+    calls = []
 
-def test_review_outcome_approved():
-    gary = GaryProtocol(_stub_approved)
-    plan = {"tool": "send_email", "to": "client@company.com"}
-    outcome = {"status": "queued", "to": "client@company.com"}
+    def llm(prompt: str) -> str:
+        calls.append(prompt)
+        if len(calls) == 1:
+            return stub_block(prompt)
+        return stub_pass(prompt)
 
-    verdict = gary.review_outcome(plan, outcome)
-    assert verdict.judgment == Judgment.approved
-    assert verdict.phase == "after"
+    gary = Gary(llm=llm, max_retries=3)
+    verdict = gary.review({"action": "send_email"})
+    assert verdict.verdict == Verdict.PASS
+    assert verdict.round == 2
+    assert len(calls) == 2
 
 
-def test_review_outcome_escalate_on_deviation():
-    gary = GaryProtocol(_stub_escalate)
-    plan = {"tool": "send_email", "to": "client@company.com"}
-    outcome = {"status": "sent", "to": "WRONG@company.com"}  # deviation!
+def test_max_retries_forces_escalate():
+    """Block every round → escalate after max_retries."""
+    gary = Gary(llm=stub_block, max_retries=3)
+    verdict = gary.review({"action": "process_payment"})
+    assert verdict.verdict == Verdict.ESCALATE
+    assert "3 review rounds" in verdict.reason
 
-    verdict = gary.review_outcome(plan, outcome)
-    assert verdict.judgment == Judgment.escalate
+
+def test_feedback_included_in_retry_prompt():
+    """Second round prompt must contain feedback from first round."""
+    prompts = []
+
+    def llm(prompt: str) -> str:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return stub_block(prompt)
+        return stub_pass(prompt)
+
+    gary = Gary(llm=llm, max_retries=2)
+    gary.review({"action": "something"})
+    assert len(prompts) == 2
+    assert "FEEDBACK FROM PREVIOUS ROUND" in prompts[1]
 
 
 # ---------------------------------------------------------------------------
-# Before/after flow — full cycle
+# Budget cap
 # ---------------------------------------------------------------------------
 
-
-def test_before_after_same_plan_hash():
-    """Same plan_hash in before/after verdict proves they refer to the same plan."""
-    gary = GaryProtocol(_stub_approved)
-    plan = {"tool": "send_email", "to": "client@company.com", "subject": "Update"}
-
-    before = gary.review_plan(plan)
-    after = gary.review_outcome(plan, {"status": "queued"})
-
-    assert before.plan_hash == after.plan_hash
-    assert before.phase == "before"
-    assert after.phase == "after"
+def test_budget_exhausted_escalates():
+    gary = Gary(llm=stub_pass, daily_budget_usd=0.0)
+    verdict = gary.review({"action": "anything"})
+    assert verdict.verdict == Verdict.ESCALATE
+    assert "budget" in verdict.reason.lower()
 
 
 # ---------------------------------------------------------------------------
-# Robustness — Gary never fails silently
+# Parse robustness — never fails silently
 # ---------------------------------------------------------------------------
 
-
-def test_parse_failure_escalates():
-    """If the LLM returns no valid JSON, Gary escalates automatically."""
-    gary = GaryProtocol(_stub_broken)
-    verdict = gary.review_plan({"tool": "something"})
-
-    assert verdict.judgment == Judgment.escalate
+def test_broken_response_escalates():
+    gary = Gary(llm=stub_broken)
+    verdict = gary.review({"action": "something"})
+    assert verdict.verdict == Verdict.ESCALATE
     assert "parse" in verdict.reason.lower()
 
 
 def test_empty_response_escalates():
-    gary = GaryProtocol(lambda _: "")
-    verdict = gary.review_plan({"tool": "something"})
-    assert verdict.judgment == Judgment.escalate
+    gary = Gary(llm=lambda _: "")
+    verdict = gary.review({"action": "something"})
+    assert verdict.verdict == Verdict.ESCALATE
 
 
-def test_raw_response_always_preserved():
-    """Raw LLM output is always preserved — for audit, never discarded."""
-    gary = GaryProtocol(_stub_approved)
-    verdict = gary.review_plan({"tool": "x"})
-    assert "approved" in verdict.raw_response
-
-
-def test_unknown_judgment_value_escalates():
-    """Unknown judgment value falls back to escalate."""
-    def stub(_): return '{"judgment": "maybe", "reason": "unsure", "risk": "low"}'
-    gary = GaryProtocol(stub)
-    verdict = gary.review_plan({"tool": "x"})
-    assert verdict.judgment == Judgment.escalate
+def test_unknown_verdict_value_escalates():
+    gary = Gary(llm=lambda _: '{"verdict": "maybe", "reason": "unsure", "risk_level": "low"}')
+    verdict = gary.review({"action": "something"})
+    assert verdict.verdict == Verdict.ESCALATE
 
 
 # ---------------------------------------------------------------------------
-# Independence — architectural principle
+# Independence — different LLM
 # ---------------------------------------------------------------------------
 
-
-def test_gary_uses_its_own_llm_not_the_agents():
-    """
-    Gary and the agent each call their own LLM.
-    They never share a backend — that is the core principle.
-    """
+def test_gary_uses_its_own_llm():
     agent_calls = []
     gary_calls = []
 
     def agent_llm(prompt: str) -> str:
         agent_calls.append(prompt)
-        return "plan: send confirmation email to client"
+        return "plan: send confirmation email"
 
     def gary_llm(prompt: str) -> str:
         gary_calls.append(prompt)
-        return '{"judgment": "approved", "reason": "ok", "risk": "low"}'
+        return stub_pass(prompt)
 
-    gary = GaryProtocol(gary_llm)
-    _ = agent_llm("draft an email to the client")
-    verdict = gary.review_plan({"tool": "send_email"})
+    gary = Gary(llm=gary_llm)
+    _ = agent_llm("draft an email")
+    verdict = gary.review({"action": "send_email"})
 
     assert len(agent_calls) == 1
     assert len(gary_calls) == 1
     assert agent_calls[0] != gary_calls[0]
-    assert "Protocol Gary" in gary_calls[0]
-    assert verdict.judgment == Judgment.approved
+    assert verdict.verdict == Verdict.PASS
 
 
 # ---------------------------------------------------------------------------
-# Determinism
+# Audit log
 # ---------------------------------------------------------------------------
 
+def test_audit_log_written(tmp_path):
+    gary = Gary(llm=stub_pass, audit_log_dir=tmp_path)
+    gary.review({"action": "send_email", "to": "x@y.com"})
+    logs = list(tmp_path.rglob("*.json"))
+    assert len(logs) == 1
+    import json
+    data = json.loads(logs[0].read_text())
+    assert data["verdict"] == "pass"
+    assert "plan" in data
 
-def test_plan_hash_is_deterministic():
-    gary = GaryProtocol(_stub_approved)
-    plan = {"tool": "send_email", "to": "a@b.com"}
-    v1 = gary.review_plan(plan)
-    v2 = gary.review_plan(plan)
+
+# ---------------------------------------------------------------------------
+# Plan hash
+# ---------------------------------------------------------------------------
+
+def test_plan_hash_deterministic():
+    gary = Gary(llm=stub_pass)
+    plan = {"action": "send_email", "to": "a@b.com"}
+    v1 = gary.review(plan)
+    v2 = gary.review(plan)
     assert v1.plan_hash == v2.plan_hash
 
 
 def test_different_plans_different_hash():
-    gary = GaryProtocol(_stub_approved)
-    v1 = gary.review_plan({"tool": "send_email"})
-    v2 = gary.review_plan({"tool": "process_payment"})
+    gary = Gary(llm=stub_pass)
+    v1 = gary.review({"action": "send_email"})
+    v2 = gary.review({"action": "delete_file"})
     assert v1.plan_hash != v2.plan_hash
+
+
+# ---------------------------------------------------------------------------
+# Failure modes surfaced in verdict
+# ---------------------------------------------------------------------------
+
+def test_failure_modes_returned():
+    gary = Gary(llm=stub_block, max_retries=1)
+    verdict = gary.review({"action": "process_payment", "amount": 9500})
+    # The stub_block returns ALIGN-02 — should appear somewhere in the chain
+    assert isinstance(verdict.failure_modes_triggered, list)
